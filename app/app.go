@@ -6,13 +6,12 @@ import (
 	"fmt"
 	"io"
 	"reflect"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/henrylee2cn/pholcus/app/crawl"
+	"github.com/henrylee2cn/pholcus/app/crawler"
 	"github.com/henrylee2cn/pholcus/app/distribute"
 	"github.com/henrylee2cn/pholcus/app/pipeline"
 	"github.com/henrylee2cn/pholcus/app/pipeline/collector"
@@ -43,24 +42,24 @@ type (
 		Status() int                                                  // 返回当前状态
 		GetSpiderLib() []*spider.Spider                               // 获取全部蜘蛛种类
 		GetSpiderByName(string) *spider.Spider                        // 通过名字获取某蜘蛛
-		GetSpiderQueue() crawl.SpiderQueue                            // 获取蜘蛛队列接口实例
+		GetSpiderQueue() crawler.SpiderQueue                          // 获取蜘蛛队列接口实例
 		GetOutputLib() []string                                       // 获取全部输出方式
 		GetTaskJar() *distribute.TaskJar                              // 返回任务库
-		CountNodes() int                                              // 服务器客户端模式下返回节点数
+		distribute.Distributer                                        // 实现分布式接口
 	}
 	Logic struct {
-		*cache.AppConf                    // 全局配置
-		spider.Traversal                  // 全部蜘蛛种类
-		crawl.SpiderQueue                 // 当前任务的蜘蛛队列
-		*distribute.TaskJar               // 服务器与客户端间传递任务的存储库
-		crawl.CrawlPool                   // 爬行回收池
-		teleport.Teleport                 // socket长连接双工通信接口，json数据传输
-		sum                 [2]uint64     // 执行计数
-		takeTime            time.Duration // 执行计时
-		status              int           // 运行状态
-		finish              chan bool
-		finishOnce          sync.Once
-		canSocketLog        bool
+		*cache.AppConf                      // 全局配置
+		*spider.SpiderSpecies               // 全部蜘蛛种类
+		crawler.SpiderQueue                 // 当前任务的蜘蛛队列
+		*distribute.TaskJar                 // 服务器与客户端间传递任务的存储库
+		crawler.CrawlerPool                 // 爬行回收池
+		teleport.Teleport                   // socket长连接双工通信接口，json数据传输
+		sum                   [2]uint64     // 执行计数
+		takeTime              time.Duration // 执行计时
+		status                int           // 运行状态
+		finish                chan bool
+		finishOnce            sync.Once
+		canSocketLog          bool
 		sync.RWMutex
 	}
 )
@@ -94,13 +93,13 @@ func New() App {
 
 func newLogic() *Logic {
 	return &Logic{
-		AppConf:     cache.Task,
-		Traversal:   spider.Menu,
-		status:      status.STOPPED,
-		Teleport:    teleport.New(),
-		TaskJar:     distribute.NewTaskJar(),
-		SpiderQueue: crawl.NewSpiderQueue(),
-		CrawlPool:   crawl.NewCrawlPool(),
+		AppConf:       cache.Task,
+		SpiderSpecies: spider.Species,
+		status:        status.STOPPED,
+		Teleport:      teleport.New(),
+		TaskJar:       distribute.NewTaskJar(),
+		SpiderQueue:   crawler.NewSpiderQueue(),
+		CrawlerPool:   crawler.NewCrawlerPool(),
 	}
 }
 
@@ -146,17 +145,15 @@ func (self *Logic) SetAppConf(k string, v interface{}) App {
 	}()
 	if k == "Limit" && v.(int64) <= 0 {
 		v = int64(spider.LIMIT)
+	} else if k == "DockerCap" && v.(int) < 1 {
+		v = int(1)
 	}
-
 	acv := reflect.ValueOf(self.AppConf).Elem()
 	key := strings.Title(k)
 	if acv.FieldByName(key).CanSet() {
 		acv.FieldByName(key).Set(reflect.ValueOf(v))
 	}
 
-	if k == "DockerCap" {
-		cache.AutoDockerQueueCap()
-	}
 	return self
 }
 
@@ -171,20 +168,20 @@ func (self *Logic) Init(mode int, port int, master string, w ...io.Writer) App {
 	self.AppConf.Mode, self.AppConf.Port, self.AppConf.Master = mode, port, master
 	self.Teleport = teleport.New()
 	self.TaskJar = distribute.NewTaskJar()
-	self.SpiderQueue = crawl.NewSpiderQueue()
-	self.CrawlPool = crawl.NewCrawlPool()
+	self.SpiderQueue = crawler.NewSpiderQueue()
+	self.CrawlerPool = crawler.NewCrawlerPool()
 
 	switch self.AppConf.Mode {
 	case status.SERVER:
 		if self.checkPort() {
 			logs.Log.Informational("                                                                                               ！！当前运行模式为：[ 服务器 ] 模式！！")
-			self.Teleport.SetAPI(distribute.ServerApi(self)).Server(":" + strconv.Itoa(self.AppConf.Port))
+			self.Teleport.SetAPI(distribute.MasterApi(self)).Server(":" + strconv.Itoa(self.AppConf.Port))
 		}
 
 	case status.CLIENT:
 		if self.checkAll() {
 			logs.Log.Informational("                                                                                               ！！当前运行模式为：[ 客户端 ] 模式！！")
-			self.Teleport.SetAPI(distribute.ClientApi(self)).Client(self.AppConf.Master, ":"+strconv.Itoa(self.AppConf.Port))
+			self.Teleport.SetAPI(distribute.SlaveApi(self)).Client(self.AppConf.Master, ":"+strconv.Itoa(self.AppConf.Port))
 			// 开启节点间log打印
 			self.canSocketLog = true
 			go self.socketLog()
@@ -243,17 +240,17 @@ func (self *Logic) SpiderPrepare(original []*spider.Spider) App {
 
 // 获取全部输出方式
 func (self *Logic) GetOutputLib() []string {
-	return collector.OutputLib
+	return collector.DataOutputLib
 }
 
 // 获取全部蜘蛛种类
 func (self *Logic) GetSpiderLib() []*spider.Spider {
-	return self.Traversal.Get()
+	return self.SpiderSpecies.Get()
 }
 
 // 通过名字获取某蜘蛛
 func (self *Logic) GetSpiderByName(name string) *spider.Spider {
-	return self.Traversal.GetByName(name)
+	return self.SpiderSpecies.GetByName(name)
 }
 
 // 返回当前运行模式
@@ -272,7 +269,7 @@ func (self *Logic) CountNodes() int {
 }
 
 // 获取蜘蛛队列接口实例
-func (self *Logic) GetSpiderQueue() crawl.SpiderQueue {
+func (self *Logic) GetSpiderQueue() crawler.SpiderQueue {
 	return self.SpiderQueue
 }
 
@@ -322,12 +319,20 @@ func (self *Logic) PauseRecover() {
 
 // Offline 模式下中途终止任务
 func (self *Logic) Stop() {
-	// 不可颠倒停止的顺序
-	self.setStatus(status.STOP)
-	self.CrawlPool.Stop()
-	scheduler.Stop()
+	if self.status == status.STOPPED {
+		return
+	}
+	if self.status != status.STOP {
+		// 不可颠倒停止的顺序
+		self.setStatus(status.STOP)
+		// println("scheduler.Stop()")
+		scheduler.Stop()
+		// println("self.CrawlerPool.Stop()")
+		self.CrawlerPool.Stop()
+	}
+	// println("wait self.IsStopped()")
 	for !self.IsStopped() {
-		runtime.Gosched()
+		time.Sleep(time.Second)
 	}
 }
 
@@ -460,7 +465,7 @@ ReStartLabel:
 		return nil
 	}
 	if self.CountNodes() == 0 && self.TaskJar.Len() == 0 {
-		time.Sleep(5e7)
+		time.Sleep(time.Second)
 		goto ReStartLabel
 	}
 
@@ -470,7 +475,7 @@ ReStartLabel:
 			if self.CountNodes() == 0 {
 				goto ReStartLabel
 			}
-			time.Sleep(5e7)
+			time.Sleep(time.Second)
 		}
 	}
 	return self.TaskJar.Pull()
@@ -486,7 +491,7 @@ func (self *Logic) taskToRun(t *distribute.Task) {
 
 	// 初始化蜘蛛队列
 	for _, n := range t.Spiders {
-		sp := spider.Menu.GetByName(n["name"])
+		sp := self.GetSpiderByName(n["name"])
 		if sp == nil {
 			continue
 		}
@@ -514,10 +519,10 @@ func (self *Logic) exec() {
 	scheduler.Init()
 
 	// 设置爬虫队列
-	crawlCap := self.CrawlPool.Reset(count)
+	crawlerCap := self.CrawlerPool.Reset(count)
 
 	logs.Log.Informational(" *     执行任务总数(任务数[*自定义配置数])为 %v 个\n", count)
-	logs.Log.Informational(" *     爬虫池容量为 %v\n", crawlCap)
+	logs.Log.Informational(" *     采集引擎池容量为 %v\n", crawlerCap)
 	logs.Log.Informational(" *     并发协程最多 %v 个\n", self.AppConf.ThreadNum)
 	logs.Log.Informational(" *     随机停顿区间为 %v~%v 毫秒\n", self.AppConf.Pausetime/2, self.AppConf.Pausetime*2)
 	logs.Log.App(" *                                                                                                 —— 开始抓取，请耐心等候 ——")
@@ -543,17 +548,21 @@ func (self *Logic) goRun(count int) {
 	for i = 0; i < count && self.Status() != status.STOP; i++ {
 	pause:
 		if self.IsPause() {
-			time.Sleep(1e9)
+			time.Sleep(time.Second)
 			goto pause
 		}
 		// 从爬行队列取出空闲蜘蛛，并发执行
-		c := self.CrawlPool.Use()
+		c := self.CrawlerPool.Use()
 		if c != nil {
-			go func(i int, c crawl.Crawler) {
+			go func(i int, c crawler.Crawler) {
 				// 执行并返回结果消息
-				c.Init(self.SpiderQueue.GetByIndex(i)).Start()
+				c.Init(self.SpiderQueue.GetByIndex(i)).Run()
 				// 任务结束后回收该蜘蛛
-				self.CrawlPool.Free(c)
+				self.RWMutex.RLock()
+				if self.status != status.STOP {
+					self.CrawlerPool.Free(c)
+				}
+				self.RWMutex.RUnlock()
 			}(i, c)
 		}
 	}
@@ -561,6 +570,7 @@ func (self *Logic) goRun(count int) {
 	for ii := 0; ii < i; ii++ {
 		s := <-cache.ReportChan
 		if (s.DataNum == 0) && (s.FileNum == 0) {
+			logs.Log.App(" *     [任务小计：%s | KEYIN：%s]   无采集结果，用时 %v！\n", s.SpiderName, s.Keyin, s.Time)
 			continue
 		}
 		logs.Log.Informational(" * ")
@@ -653,7 +663,6 @@ func (self *Logic) setAppConf(task *distribute.Task) {
 	self.AppConf.Pausetime = task.Pausetime
 	self.AppConf.OutType = task.OutType
 	self.AppConf.DockerCap = task.DockerCap
-	self.AppConf.DockerQueueCap = task.DockerQueueCap
 	self.AppConf.SuccessInherit = task.SuccessInherit
 	self.AppConf.FailureInherit = task.FailureInherit
 	self.AppConf.Limit = task.Limit
@@ -665,7 +674,6 @@ func (self *Logic) setTask(task *distribute.Task) {
 	task.Pausetime = self.AppConf.Pausetime
 	task.OutType = self.AppConf.OutType
 	task.DockerCap = self.AppConf.DockerCap
-	task.DockerQueueCap = self.AppConf.DockerQueueCap
 	task.SuccessInherit = self.AppConf.SuccessInherit
 	task.FailureInherit = self.AppConf.FailureInherit
 	task.Limit = self.AppConf.Limit

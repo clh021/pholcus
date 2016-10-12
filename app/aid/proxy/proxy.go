@@ -3,10 +3,10 @@ package proxy
 import (
 	"io/ioutil"
 	"log"
+	"net/http"
 	"net/url"
 	"os"
 	"regexp"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -101,7 +101,7 @@ func (self *Proxy) findOnline() *Proxy {
 		}(proxy)
 	}
 	for len(self.threadPool) > 0 {
-		runtime.Gosched()
+		time.Sleep(0.2e9)
 	}
 	log.Printf(" *     在线代理IP筛选完成，共计：%v 个\n", self.online)
 
@@ -201,7 +201,7 @@ func (self *Proxy) testAndSort(key string, testHost string) (*ProxyForHost, bool
 		}(proxy)
 	}
 	for len(self.threadPool) > 0 {
-		runtime.Gosched()
+		time.Sleep(0.2e9)
 	}
 	if proxyForHost.Len() > 0 {
 		sort.Sort(proxyForHost)
@@ -215,14 +215,15 @@ func (self *Proxy) testAndSort(key string, testHost string) (*ProxyForHost, bool
 // 测试代理ip可用性
 func (self *Proxy) findUsable(proxy string, testHost string) (alive bool, timedelay time.Duration) {
 	t0 := time.Now()
-	_, err := self.surf.Download(&request.Request{
+	req := &request.Request{
 		Url:         testHost,
-		Proxy:       proxy,
 		Method:      "HEAD",
+		Header:      make(http.Header),
 		DialTimeout: time.Second * time.Duration(DAIL_TIMEOUT),
 		ConnTimeout: time.Second * time.Duration(CONN_TIMEOUT),
 		TryTimes:    TRY_TIMES,
-	})
-
+	}
+	req.SetProxy(proxy)
+	_, err := self.surf.Download(req)
 	return err == nil, time.Since(t0)
 }
